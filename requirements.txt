@@ -1,0 +1,6 @@
+pyTelegramBotAPI
+telebot
+telebot-calendar
+gspread
+oauth2client
+python-dotenv
