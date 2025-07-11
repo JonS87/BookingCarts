@@ -1,6 +1,8 @@
-pyTelegramBotAPI
 telebot
-telebot-calendar
 gspread
 oauth2client
+pytz
+schedule
+Flask
+requests
 python-dotenv
