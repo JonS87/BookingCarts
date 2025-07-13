@@ -17,6 +17,9 @@ from threading import Thread, Timer
 import logging
 import uuid
 import requests
+from dotenv import load_dotenv 
+
+load_dotenv('/home/EvgeniyC87/BookingCarts/.env')  
 
 # Настройка логирования
 logging.basicConfig(
@@ -1465,7 +1468,7 @@ def internal_error(e):
 def run_flask():
     port = int(os.environ.get('PORT', 8080))
     logger.info(f"Starting web server on port {port}...")
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    # app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 
 if __name__ == '__main__':
