@@ -1,0 +1,1 @@
+2025-07-11 11:18:39,348 - __main__ - ERROR - Ошибка загрузки JSON: the JSON object must be str, bytes or bytearray, not NoneType

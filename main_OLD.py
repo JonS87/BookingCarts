@@ -62,9 +62,6 @@ reminder_status = {}
 # Глобальные переменные для управления кэшем
 safe_send_message_counter = 0
 
-TIME_BUFFER_MINUTES = 15  # Временной буфер между бронями
-ALERT_BUFFER_MINUTES = 10  # За сколько минут до брони отправлять алерт
-
 try:
     GOOGLE_CREDS = json.loads(GOOGLE_CREDS_JSON)
 except Exception as e:
@@ -706,6 +703,10 @@ def generate_time_slots(date, step_minutes=15):
             # Добавляем слот с информацией о количестве тележек
             time_slots.append(f"{slot_str} ({available_count})")
 
+        # available_cart = find_available_cart(slot, slot_end)
+        # if available_cart:
+        #     time_slots.append(slot_str)
+
         slot += datetime.timedelta(minutes=step_minutes)
 
     # Сохранение в кэш
@@ -734,11 +735,74 @@ def create_time_keyboard(time_slots, row_width=4):
     return keyboard
 
 
+# # Поиск свободной тележки
+# def find_available_cart(start_time, end_time):
+#     # Принудительное обновление кэша если данные устарели
+#     # data_cache.refresh()
+#
+#     if start_time.tzinfo is None:
+#         start_time = tz.localize(start_time)
+#     if end_time.tzinfo is None:
+#         end_time = tz.localize(end_time)
+#
+#     # Создаем ключ для кэша (дата + час)
+#     date_key = start_time.date()
+#     hour_key = start_time.hour
+#     cache_key = f"{date_key}_{hour_key}"
+#
+#     with data_cache.lock:
+#         # Проверка кэша доступных тележек
+#         if cache_key in data_cache.cart_availability:
+#             return data_cache.cart_availability[cache_key]
+#
+#         occupied_carts = set()
+#         current_reservations = data_cache.reservations.copy()
+#
+#         for res in current_reservations:
+#             if res['status'] in ['Отменена', 'Завершена']:
+#                 continue
+#             if (res['start'] < end_time) and (res['end'] > start_time):
+#                 occupied_carts.add(res['cart'])
+#
+#         available_carts = [
+#             cart for cart, data in data_cache.carts.items()
+#             if data['active'] and cart not in occupied_carts
+#         ]
+#
+#         available_carts.sort(key=lambda x: int(x.split()[-1]))
+#         result = available_carts[0] if available_carts else None
+#
+#         # Кэшируем результат
+#         data_cache.cart_availability[cache_key] = result
+#
+#         if available_carts:
+#             logger.info(f"Найдена свободная тележка: {available_carts[0]}")
+#         else:
+#             logger.info("Свободных тележек не найдено")
+#
+#         return result
+
+# Поиск одной доступной тележки
+def find_one_available_cart(start_time, end_time):
+    """
+    Возвращает первую доступную тележку на заданном интервале
+    """
+    # Получаем все активные тележки
+    with data_cache.lock:
+        active_carts = [cart for cart, data in data_cache.carts.items() if data['active']]
+
+    # Перебираем тележки в порядке их названия
+    for cart in sorted(active_carts):
+        # Проверяем доступность конкретной тележки
+        if is_cart_available(cart, start_time, end_time):
+            return cart
+    return None
+
+
 # Функция проверки доступности конкретной тележки
 def is_cart_available(cart_name, start_time, end_time):
     """
-    Проверяет доступность тележки
-    Буфер: новая бронь может начаться только после окончания предыдущей + 15мин
+    Проверяет, доступна ли конкретная тележка на заданном интервале
     """
     with data_cache.lock:
         reservations = data_cache.reservations.copy()
@@ -752,9 +816,7 @@ def is_cart_available(cart_name, start_time, end_time):
             continue
 
         # Проверяем пересечение интервалов
-        res_end_with_buffer = res['end'] + datetime.timedelta(minutes=TIME_BUFFER_MINUTES)
-
-        if (res['start'] < end_time) and (res_end_with_buffer > start_time): #(res['end'] > start_time):
+        if (res['start'] < end_time) and (res['end'] > start_time):
             return False
 
     return True
@@ -763,7 +825,7 @@ def is_cart_available(cart_name, start_time, end_time):
 # Функция для подсчета доступных тележек на интервале
 def count_available_carts(start_time, end_time):
     """
-    Возвращает количество тележек, доступных на заданном интервале времени с учетом буфера
+    Возвращает количество тележек, доступных на заданном интервале времени
     """
     if start_time.tzinfo is None:
         start_time = tz.localize(start_time)
@@ -784,11 +846,8 @@ def count_available_carts(start_time, end_time):
         if res['status'] in ['Отменена', 'Завершена']:
             continue
 
-        # Буфер для окончания существующих броней
-        res_end_with_buffer = res['end'] + datetime.timedelta(minutes=TIME_BUFFER_MINUTES)
-
         # Проверяем пересечение интервалов
-        if (res['start'] < end_time) and (res_end_with_buffer > start_time): #(res['end'] > start_time):
+        if (res['start'] < end_time) and (res['end'] > start_time):
             occupied_carts.add(res['cart'])
 
     # Доступные тележки = все активные - занятые
@@ -811,201 +870,6 @@ def send_notification(message, photo_id=None):
                 safe_send_message(NOTIFICATION_CHAT_ID, message)
     except Exception as e:
         logger.error(f"Ошибка отправки уведомления: {str(e)}")
-
-
-def check_upcoming_reservations():
-    """
-    Проверяет предстоящие брони и отправляет уведомления о конфликтах
-    """
-    try:
-        current_time = datetime.datetime.now(tz)
-        logger.info("🔍 Проверка предстоящих броней...")
-
-        with data_cache.lock:
-            active_reservations = [
-                r for r in data_cache.reservations
-                if r['status'] == 'Активна'
-            ]
-
-        for reservation in active_reservations:
-            check_reservation_conflicts(reservation, current_time)
-
-    except Exception as e:
-        logger.error(f"Ошибка проверки предстоящих броней: {str(e)}")
-
-
-def check_reservation_conflicts(active_reservation, current_time):
-    """
-    Проверяет конфликты для активной брони
-    """
-    try:
-        cart_name = active_reservation['cart']
-        end_time = active_reservation['end']
-        # username = active_reservation['username']
-
-        # Ищем брони, которые начинаются вскоре после окончания текущей
-        with data_cache.lock:
-            upcoming_reservations = [
-                r for r in data_cache.reservations
-                if r['status'] in ['Активна', 'Ожидает подтверждения']
-                   and r['cart'] == cart_name
-                   and end_time <= r['start'] <= end_time + datetime.timedelta(minutes=ALERT_BUFFER_MINUTES)
-                   and r['start'] >= end_time  # Но не раньше окончания текущей
-            ]
-
-        for upcoming_res in upcoming_reservations:
-            # Напоминание пользователю за 15 минут до окончания
-            send_user_reminder(active_reservation, upcoming_res)
-
-            # Проверяем время для алерта: за 10 минут до начала следующей брони
-            alert_time = upcoming_res['start'] - datetime.timedelta(minutes=ALERT_BUFFER_MINUTES)
-
-            # Отправляем алерт только если сейчас подходящее время
-            if (current_time >= alert_time and
-                active_reservation['status'] == 'Активна'):
-
-                send_conflict_alert(active_reservation, upcoming_res, current_time)
-
-    except Exception as e:
-        logger.error(f"Ошибка проверки конфликта {active_reservation.get('id', 'unknown')}: {e}")
-
-
-def check_alternative_carts_availability(start_time, end_time, excluded_cart):
-    """
-    Проверяет доступность других тележек кроме исключенной
-    """
-    with data_cache.lock:
-        active_carts = [
-            cart for cart, data in data_cache.carts.items()
-            if data['active'] and cart != excluded_cart
-        ]
-
-    for cart in active_carts:
-        if is_cart_available(cart, start_time, end_time):
-            return True
-    return False
-
-
-def find_next_reservation_for_cart(after_time, cart_name):
-    """
-    Находит следующую бронь для конкретной тележки после указанного времени
-    """
-    with data_cache.lock:
-        future_reservations = [
-            r for r in data_cache.reservations
-            if r['cart'] == cart_name
-               and r['start'] > after_time
-               and r['status'] in ['Активна', 'Ожидает подтверждения']
-        ]
-
-    if future_reservations:
-        return min(future_reservations, key=lambda x: x['start'])
-    return None
-
-
-def find_best_available_cart(start_time, end_time, username):
-    """
-    Находит лучшую тележку с учетом будущих броней
-    """
-    with data_cache.lock:
-        active_carts = [cart for cart, data in data_cache.carts.items() if data['active']]
-
-    available_carts = []
-    cart_scores = {}
-
-    # Сначала собираем все доступные тележки
-    for cart in active_carts:
-        if is_cart_available(cart, start_time, end_time):
-            available_carts.append(cart)
-
-    # Если доступных тележек нет - возвращаем None
-    if not available_carts:
-        return None
-
-    # Если доступна только одна тележка - возвращаем ее
-    if len(available_carts) == 1:
-        return available_carts[0]
-
-    # Для нескольких доступных тележек применяем "умный" выбор
-    for cart in available_carts:
-        # Считаем "ценность" тележки:
-        score = 0
-
-        # Предпочтение тележкам, у которых нет броней сразу после
-        next_booking = find_next_reservation_for_cart(end_time, cart)
-        if not next_booking:
-            score += 10  # Самая безопасная тележка
-        else:
-            # Если следующая бронь далеко - тоже хорошо
-            time_gap = (next_booking['start'] - end_time).total_seconds() / 3600  # в часах
-            if time_gap > 2:
-                score += 5
-
-        # Предпочтение той же тележке, если пользователь уже бронировал ее сегодня
-        user_today_bookings = [
-            r for r in data_cache.reservations
-            if r['username'] == username
-               and r['start'].date() == start_time.date()
-               and r['cart'] == cart
-        ]
-        if user_today_bookings:
-            score += 3  # Пользователь уже брал эту тележку сегодня
-
-        cart_scores[cart] = score
-
-    return max(cart_scores.items(), key=lambda x: x[1])[0]
-
-
-def send_conflict_alert(ending_reservation, upcoming_reservation, current_time):
-    """
-    Отправляет алерты о возможном конфликте
-    """
-
-    # Ключ для предотвращения повторных алертов
-    alert_key = f"conflict_alert_{ending_reservation['id']}_{upcoming_reservation['id']}"
-
-    if reminder_status.get(alert_key):
-        return  # Уже отправляли алерт
-
-    try:
-        # time_until_next = upcoming_reservation['start'] - current_time
-
-        # Отправляем алерт в общий чат за 10 минут
-        # if time_until_next <= datetime.timedelta(minutes=ALERT_BUFFER_MINUTES):
-        alert_message = (
-            f"🚨 ВНИМАНИЕ!\n"
-            f"Тележка '{ending_reservation['cart']}' взятая "
-            f"@{ending_reservation['username']} в {ending_reservation['end'].strftime('%H:%M')} не возвращена.\n"
-            f"Следующая бронь @{upcoming_reservation['username']} в {upcoming_reservation['start'].strftime('%H:%M')} под угрозой."
-        )
-        send_notification(alert_message)
-        reminder_status[alert_key] = True  # Помечаем как отправленное
-
-    except Exception as e:
-        logger.error(f"Ошибка отправки алерта: {str(e)}")
-
-
-def send_user_reminder(ending_reservation, upcoming_reservation):
-    """
-    Отправляет вежливое напоминание пользователю за 15 минут до окончания
-    """
-    reminder_key = f"user_reminder_{ending_reservation['id']}"
-
-    if reminder_status.get(reminder_key):
-        return
-
-    reminder_time = ending_reservation['end'] - datetime.timedelta(minutes=15)
-    current_time = datetime.datetime.now(tz)
-
-    if current_time >= reminder_time:
-        reminder_message = (
-            f"🚨 ВНИМАНИЕ!\n"
-            f"Ваша бронь тележки {ending_reservation['cart']} заканчивается в {ending_reservation['end'].strftime('%H:%M')}.\n"
-            f"@{upcoming_reservation['username']} забронировал тележку на {upcoming_reservation['start'].strftime('%H:%M')}.\n"
-            f"Пожалуйста, верните тележку заблаговременно!"
-        )
-        safe_send_message(ending_reservation['chat_id'], reminder_message)
-        reminder_status[reminder_key] = True
 
 
 # Обработчик команды /start
@@ -1256,7 +1120,7 @@ def handle_end_time(message):
             return
 
         # Находим конкретную свободную тележку
-        cart = find_best_available_cart(start_time, end_time, username)
+        cart = find_one_available_cart(start_time, end_time)
 
         # Генерация ID брони
         reservation_id = generate_reservation_id()
@@ -1310,24 +1174,6 @@ def handle_end_time(message):
             data_cache.reservations.append(new_reservation)
             # Обновляем хеш бронирований
             data_cache.data_hashes['reservations'] = data_cache.calculate_hash(data_cache.reservations)
-
-        # Находим следующую бронь для этой тележки
-        next_reservation = find_next_reservation_for_cart(end_time, cart)
-
-        if next_reservation:
-            # Рассчитываем разницу во времени между окончанием и следующей бронью
-            time_gap = (next_reservation['start'] - end_time).total_seconds() / 60  # в минутах
-
-            # Уведомляем только если разница менее 1 час (60 минут)
-            if time_gap <= 60:
-                notification_text = (
-                    f"📢 Важная информация!\n\n"
-                    f"После вашей брони тележка {cart} будет нужна другому пользователю:\n"
-                    f"⏰ Следующая бронь: {next_reservation['start'].strftime('%H:%M')}\n"
-                    f"👤 Пользователь: @{next_reservation['username']}\n\n"
-                    f"Пожалуйста, верните тележку заблаговременно!"
-                )
-                safe_send_message(chat_id, notification_text)
 
         # Формирование сообщения подтверждения
         confirm_text = (
@@ -2640,6 +2486,7 @@ def get_help_text(username=None):
     return base_text
 
 
+
 def send_username_requirement(chat_id, message_text):
     warning_msg = """
 👋 Добро пожаловать! 👋
@@ -2693,37 +2540,15 @@ def periodic_refresh():
         logger.error(f"Ошибка периодического обновления: {str(e)}")
 
 
-def cleanup_old_alerts():
-    """
-    Очищает старые алерты из памяти чтобы не копился мусор
-    """
-    current_time = time.time()
-    keys_to_remove = []
-
-    for key in list(reminder_status.keys()):
-        # Для конфликт-алертов: удаляем через 2 часа после создания
-        if key.startswith('conflict_alert_') and current_time - reminder_status[key] > 7200:  # 1 час
-            keys_to_remove.append(key)
-
-        # Для смарт-напоминаний: удаляем через 4 часа
-        elif key.startswith('smart_reminder_'):
-            if current_time - reminder_status[key] > 14400:  # 4 часа
-                keys_to_remove.append(key)
-
-    for key in keys_to_remove:
-        del reminder_status[key]
-
-    logger.info(f"Очищено {len(keys_to_remove)} старых алертов")
-
-
 def start_scheduler():
-    schedule.every(1).minutes.do(send_reminders) # Напоминания за 15 минут до начала и окончания
-    schedule.every(2).minutes.do(check_all_pending_reservations) # Отмена неподтвержденных броней
-    schedule.every(30).minutes.do(periodic_refresh) # Регулярное обновление кэша
-    schedule.every(30).minutes.do(cleanup_states) # Очистка устаревших состояний
-
-    schedule.every(5).minutes.do(check_upcoming_reservations) # Проверка конфликтов
-    schedule.every(1).hours.do(cleanup_old_alerts) # Удаление астарых алертов из памяти
+    # Напоминания за 15 минут до начала и окончания
+    schedule.every(1).minutes.do(send_reminders)
+    # Отмена неподтвержденных броней
+    schedule.every(2).minutes.do(check_all_pending_reservations)
+    # Регулярное обновление кэша
+    schedule.every(30).minutes.do(periodic_refresh)
+    # Очистка устаревших состояний
+    schedule.every(30).minutes.do(cleanup_states)
 
     while True:
         try:
