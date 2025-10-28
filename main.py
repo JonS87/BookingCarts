@@ -87,16 +87,86 @@ class DataCache:
         self.reservations = []
         self.carts = {}
         self.slots = {}
-        # self.cart_availability = {}
         self.last_update = 0
         self.lock = Lock()
-        self.expiration = 300  # 5 минут
+        self.expiration = 86400  # 24 часа - теперь не важно, так как управляем вручную
         self.slots_ttl = 120  # 2 минуты для слотов
         self.data_hashes = {
             'users': None,
             'reservations': None,
             'carts': None
         }
+        self._dirty_flags = {
+            'reservations': True,  # Изначально помечаем как грязные
+            'carts': True,
+            'users': True
+        }
+
+    def mark_dirty(self, sections=None):
+        """Помечает разделы как устаревшие после изменений"""
+        with self.lock:
+            if sections is None:
+                sections = ['reservations', 'carts', 'users']
+            elif isinstance(sections, str):
+                sections = [sections]
+
+            for section in sections:
+                if section in self._dirty_flags:
+                    self._dirty_flags[section] = True
+            # Очищаем кэш слотов при любых изменениях бронирований
+            if 'reservations' in sections:
+                self.slots = {}
+
+    def mark_clean(self, sections=None):
+        """Помечает разделы как актуальные после обновления"""
+        with self.lock:
+            if sections is None:
+                sections = ['reservations', 'carts', 'users']
+            elif isinstance(sections, str):
+                sections = [sections]
+
+            for section in sections:
+                if section in self._dirty_flags:
+                    self._dirty_flags[section] = False
+
+    def is_dirty(self, sections=None):
+        """Проверяет, нуждаются ли разделы в обновлении"""
+        with self.lock:
+            if sections is None:
+                sections = ['reservations', 'carts', 'users']
+            elif isinstance(sections, str):
+                sections = [sections]
+
+            for section in sections:
+                if self._dirty_flags.get(section, True):
+                    return True
+            return False
+
+    def smart_refresh(self, required_sections=None):
+        """Умное обновление - только грязных разделов"""
+        if required_sections is None:
+            required_sections = ['reservations', 'carts', 'users']
+        elif isinstance(required_sections, str):
+            required_sections = [required_sections]
+
+        # Определяем какие разделы действительно нужно обновить
+        sections_to_update = []
+        for section in required_sections:
+            if self.is_dirty(section):
+                sections_to_update.append(section)
+
+        if not sections_to_update:
+            logger.debug("Все запрошенные данные актуальны, обновление не требуется")
+            return False
+
+        logger.info(f"Обновляем разделы: {sections_to_update}")
+        result = self.refresh(partial=sections_to_update)
+
+        # Помечаем обновленные разделы как чистые
+        if result:
+            self.mark_clean(sections_to_update)
+
+        return result
 
     def is_expired(self):
         return time.time() - self.last_update > self.expiration
@@ -428,7 +498,7 @@ def safe_send_message(chat_id, text, reply_markup=None, parse_mode=None, max_ret
             logger.info(f"Сообщение успешно отправлено на chat_id {chat_id}")
             return True
 
-        except(requests.exceptions.ProxyError, RemoteDisconnected) as e:
+        except(requests.exceptions.ProxyError, RemoteDisconnected, requests.exceptions.ConnectionError) as e:
             if attempt == max_retries - 1:
                 logger.error(f"Прокси недоступен. Не удалось отправить сообщение после {max_retries} попыток")
                 return False
@@ -451,7 +521,7 @@ def update_reservation_in_cache(updated_data):
     """Обновляет конкретную бронь в кэше"""
     reservation_id = str(updated_data.get('id', ''))
     if not reservation_id:
-        logger.debug(f"False due to - not reservation_id")
+        logger.debug(f"reservation_id не найдена")
         return False
 
     try:
@@ -474,7 +544,9 @@ def update_reservation_in_cache(updated_data):
 
             # Пересчитываем хеш бронирований
             data_cache.data_hashes['reservations'] = data_cache.calculate_hash(data_cache.reservations)
-            return found
+            # data_cache.mark_dirty('reservations')
+
+        return found
     except Exception as e:
         logger.error(f"Ошибка обновления кэша: {str(e)}")
         return False
@@ -606,61 +678,81 @@ def cleanup_states():
 
 # Отмена бронирования
 def cancel_reservation(reservation_id, reason=""):
+    """
+        Улучшенная функция отмены брони с гарантированной очисткой кэша
+        """
+    reservation_id = str(reservation_id)
+    logger.info(f"🔍 Начинаем отмену брони {reservation_id}, причина: {reason}")
+
     try:
+        # Шаг 1: Сначала удаляем из кэша (даже если бронь не найдена в таблице)
+        logger.info(f"🔄 Шаг 1: Удаляем бронь {reservation_id} из кэша")
+        cache_success = delete_reservation_from_cache(reservation_id)
+        logger.info(f"{'✅' if cache_success else '❌'} Удаление из кэша: {cache_success}")
+
         if not worksheet_headers.get('Бронирования'):
             init_worksheet_headers()
 
         spreadsheet = connect_google_sheets()
         sheet = spreadsheet.worksheet('Бронирования')
         records = sheet.get_all_records()
-        reservation_id = str(reservation_id)
+
+        logger.info(f"🔍 Ищем бронь {reservation_id} для отмены...")
+
+        found_in_table = False
+        table_updated = False
 
         for i, record in enumerate(records, start=2):
             if str(record['ID']) == reservation_id:
-                if record['Статус'] in ['Отменена', 'Завершена']:
-                    logger.warning(f"Бронь {reservation_id} уже отменена")
-                    # Обноваление кэша конкретной брони
-                    updated_res = {
-                        'id': reservation_id,
-                        'status': 'Отменена'
-                    }
-                    update_reservation_in_cache(updated_res)
-                    return False
+                found_in_table = True
+                logger.info(f"📋 Нашли бронь {reservation_id} в таблице, строка {i}")
 
+                if record['Статус'] in ['Отменена', 'Завершена']:
+                    logger.warning(f"⚠️ Бронь {reservation_id} уже отменена")
+                    return True
+
+                # ОБНОВЛЯЕМ СТАТУС В ТАБЛИЦЕ
                 status_col = worksheet_headers['Бронирования']['Статус']
                 sheet.update_cell(i, status_col, 'Отменена')
+                table_updated = True
+                logger.info(f"✅ Обновили статус брони {reservation_id} в таблице на 'Отменена'")
+                break
 
-                logger.info(f"Обноляем кэш для {reservation_id}")
-                # Обноваление кэша конкретной брони
-                updated_res = {
-                    'id': str(reservation_id),
-                    'status': 'Отменена'
-                }
-                update_reservation_in_cache(updated_res)
+        if not found_in_table:
+            logger.warning(f"📋 Бронь {reservation_id} не найдена в таблице, но удалена из кэша")
+            return cache_success  # Возвращаем статус очистки кэша
 
-                logger.info(f"Отменяем все таймеры для {reservation_id}")
-                # Отменить все таймеры для этой брони
-                if reservation_id in reservation_timers:
-                    for timer in reservation_timers[reservation_id]:
-                        timer.cancel()
-                    del reservation_timers[reservation_id]
+        # Шаг 3: Очищаем таймеры и напоминания
+        logger.info(f"🔄 Шаг 3: Очищаем таймеры и напоминания для {reservation_id}")
+        if reservation_id in reservation_timers:
+            for timer in reservation_timers[reservation_id]:
+                timer.cancel()
+            del reservation_timers[reservation_id]
+            logger.info(f"✅ Удалили таймеры для {reservation_id}")
 
-                # Очищаем связанные напоминания
-                keys_to_remove = [key for key in reminder_status if key.endswith(f"_{reservation_id}")]
-                for key in keys_to_remove:
-                    if key in reminder_status:
-                        del reminder_status[key]
+        # Очищаем связанные напоминания
+        keys_to_remove = [key for key in reminder_status if key.endswith(f"_{reservation_id}")]
+        for key in keys_to_remove:
+            if key in reminder_status:
+                del reminder_status[key]
+                logger.info(f"✅ Удалили напоминание: {key}")
 
-                logger.info(f"Бронь {reservation_id} отменена по причине: {reason}")
-                return True
-        return False
+        logger.info(f"🎉 Бронь {reservation_id} полностью отменена. Кэш: {cache_success}, Таблица: {table_updated}")
+        return cache_success and table_updated
     except Exception as e:
-        logger.error(f"Ошибка отмены брони: {str(e)}")
+        logger.error(f"❌ Критическая ошибка при отмене брони {reservation_id}: {str(e)}")
+        logger.error(traceback.format_exc())
         return False
 
 
 # Генерация временных слотов с учетом занятости
 def generate_time_slots(date, step_minutes=15):
+    """
+    Генерация слотов с умным кэшированием
+    """
+    # Умное обновление данных перед расчетом
+    data_cache.smart_refresh(['reservations', 'carts'])
+
     with data_cache.lock:
         slots_cache_copy = data_cache.slots.copy()
 
@@ -1008,6 +1100,111 @@ def send_user_reminder(ending_reservation, upcoming_reservation):
         reminder_status[reminder_key] = True
 
 
+# Функция генерации слотов для продления (только свободные слоты)
+def generate_extension_slots(reservation):
+    """
+    Генерация только доступных слотов для продления
+    """
+    cart_name = reservation['cart']
+    current_end = reservation['end']
+
+    # Начинаем с текущего окончания + минимальный шаг
+    start_time = current_end + datetime.timedelta(minutes=15)
+
+    # Максимальное время - конец дня
+    max_time = tz.localize(datetime.datetime.combine(
+        current_end.date(), datetime.time(23, 45)
+    ))
+
+    # Находим следующую бронь для этой тележки (ограничитель)
+    with data_cache.lock:
+        next_reservation = min(
+            (r for r in data_cache.reservations
+             if r['cart'] == cart_name
+             and r['start'] > current_end
+             and r['status'] in ['Активна', 'Ожидает подтверждения']),
+            key=lambda x: x['start'],
+            default=None
+        )
+
+    # Если есть следующая бронь, ограничиваем максимальное время
+    if next_reservation:
+        max_time = min(max_time, next_reservation['start'] - datetime.timedelta(minutes=TIME_BUFFER_MINUTES))
+
+    time_slots = []
+    slot = start_time
+
+    while slot <= max_time:
+        # Проверяем доступность на всем интервале [оригинальное начало - новый конец]
+        if is_cart_available(cart_name, reservation['start'], slot):
+            slot_str = slot.strftime('%H:%M')
+
+            # Добавляем информацию о доступности (опционально)
+            # available_count = count_available_carts(reservation['start'], slot)
+            # time_slots.append(f"{slot_str} ({available_count})")
+            time_slots.append(f"{slot_str}")
+
+        slot += datetime.timedelta(minutes=15)
+
+    if not time_slots:
+        logger.warning(f"Нет доступных слотов для продления брони {reservation['id']}")
+
+    return time_slots
+
+
+def update_cache_after_booking(new_reservation):
+    """
+    Локально обновляет кэш после создания брони
+    """
+    with data_cache.lock:
+        # Добавляем новую бронь в кэш
+        data_cache.reservations.append(new_reservation)
+
+        # Пересчитываем хеш
+        data_cache.data_hashes['reservations'] = data_cache.calculate_hash(data_cache.reservations)
+
+    # Помечаем бронирования как измененные
+    data_cache.mark_dirty('reservations')
+    logger.debug("Кэш бронирований помечен как измененный после создания брони")
+
+
+def delete_reservation_from_cache(reservation_id):
+    """Полностью удаляет бронь из кэша"""
+    reservation_id = str(reservation_id)
+    with data_cache.lock:
+        initial_count = len(data_cache.reservations)
+
+        # ДЕБАГ: логируем что есть в кэше перед удалением
+        found_before = [r['id'] for r in data_cache.reservations if str(r.get('id')) == reservation_id]
+        logger.debug(f"Кэш до удаления: {found_before}")
+
+        # Фильтруем список, оставляя только брони с другим ID
+        data_cache.reservations = [
+            r for r in data_cache.reservations
+            if str(r.get('id')) != reservation_id
+        ]
+        final_count = len(data_cache.reservations)
+
+        # Если количество изменилось - бронь была удалена
+        if initial_count != final_count:
+            # Пересчитываем хеш
+            data_cache.data_hashes['reservations'] = data_cache.calculate_hash(data_cache.reservations)
+            # Помечаем как "грязные" для будущих обновлений
+            data_cache.mark_dirty('reservations')
+            logger.debug(f"Бронь {reservation_id} удалена из кэша ({initial_count} -> {final_count})")
+
+            # ДЕБАГ: логируем что осталось в кэше после удаления
+            found_after = [r['id'] for r in data_cache.reservations if str(r.get('id')) == reservation_id]
+            logger.debug(f"Кэш после удаления: {found_after}")
+            return True
+        else:
+            logger.warning(f"⚠️ Бронь {reservation_id} не найдена в кэше. Всего броней: {final_count}")
+            # Логируем существующие ID для отладки
+            existing_ids = [r['id'] for r in data_cache.reservations]
+            logger.debug(f"📋 Существующие ID в кэше: {existing_ids}")
+            return False
+
+
 # Обработчик команды /start
 @bot.message_handler(commands=['start'])
 @private_chat_only
@@ -1107,6 +1304,10 @@ def handle_calendar(call):
         if parts[1] == 'DAY':
             name, action, year, month, day = call.data.split(calendar_callback.sep)
             date = datetime.datetime(int(year), int(month), int(day))
+
+            # Умное обновление - только если данные помечены как устаревшие
+            data_cache.smart_refresh(['reservations', 'carts'])
+
             time_slots = generate_time_slots(date)
 
             if not time_slots:
@@ -1223,19 +1424,21 @@ def handle_end_time(message):
         hours, minutes = map(int, time_str.split(':'))
         start_time = state['start_time']
 
-        # Создаем объект времени окончания
-        end_time = datetime.datetime(
-            start_time.year,
-            start_time.month,
-            start_time.day,
-            hours,
-            minutes,
-            tzinfo=tz
-        )
+        # # Создаем объект времени окончания
+        # end_time = datetime.datetime(
+        #     start_time.year,
+        #     start_time.month,
+        #     start_time.day,
+        #     hours,
+        #     minutes,
+        #     tzinfo=tz
+        # )
+        # СОЗДАЕМ ВРЕМЯ ОКОНЧАНИЯ В ТОМ ЖЕ ЧАСОВОМ ПОЯСЕ, ЧТО И START_TIME
+        end_time = start_time.replace(hour=hours, minute=minutes)
 
-        # Корректная локализация времени
-        if end_time.tzinfo is None:
-            end_time = tz.localize(end_time)
+        # # Корректная локализация времени
+        # if end_time.tzinfo is None:
+        #     end_time = tz.localize(end_time)
 
         # Если время окончания меньше времени начала, добавляем 1 день
         if end_time < start_time:
@@ -1306,10 +1509,12 @@ def handle_end_time(message):
             'chat_id': str(chat_id)
         }
 
-        with data_cache.lock:
-            data_cache.reservations.append(new_reservation)
-            # Обновляем хеш бронирований
-            data_cache.data_hashes['reservations'] = data_cache.calculate_hash(data_cache.reservations)
+        # with data_cache.lock:
+        #     data_cache.reservations.append(new_reservation)
+        #     # Обновляем хеш бронирований
+        #     data_cache.data_hashes['reservations'] = data_cache.calculate_hash(data_cache.reservations)
+        # Локально обновляем кэш
+        update_cache_after_booking(new_reservation)
 
         # Находим следующую бронь для этой тележки
         next_reservation = find_next_reservation_for_cart(end_time, cart)
@@ -1345,8 +1550,17 @@ def handle_end_time(message):
             types.InlineKeyboardButton('✅ Подтвердить', callback_data='confirm_reservation')
         )
 
-        safe_send_message(chat_id, confirm_text, reply_markup=types.ReplyKeyboardRemove())
-        safe_send_message(chat_id, "Подтвердите бронирование:", reply_markup=keyboard)
+        # safe_send_message(chat_id, confirm_text, reply_markup=types.ReplyKeyboardRemove())
+        # safe_send_message(chat_id, "Подтвердите бронирование:", reply_markup=keyboard)
+        safe_send_message(chat_id, confirm_text, reply_markup=keyboard)
+
+        # Отправляем основное меню
+        safe_send_message(
+            chat_id,
+            "📋 Так же, для управления бронями Вы можете использовать меню ниже:",
+            reply_markup=create_main_keyboard(username)
+        )
+
         logger.info(f"Бронирование создано для {username}: {cart} с {start_time} по {end_time}")
 
     except Exception as e:
@@ -1354,6 +1568,99 @@ def handle_end_time(message):
         logger.error(f"Ошибка выбора времени окончания: {error_id} - {str(e)}")
         logger.error(traceback.format_exc())
         safe_send_message(chat_id, f'❌ Произошла ошибка ({error_id}). Попробуйте позже или выберите другое время.')
+
+
+@bot.message_handler(func=lambda message: USER_STATES.get(message.chat.id, {}).get('step') == 'select_extension_time')
+@private_chat_only
+def handle_extension_time(message):
+    chat_id = message.chat.id
+    input_text = message.text.strip()
+    state = USER_STATES[chat_id]
+    reservation_id = state['reservation_id']
+
+    if input_text == 'Отмена':
+        safe_send_message(chat_id, "❌ Продление отменено")
+        del USER_STATES[chat_id]
+        return
+
+    try:
+        # Парсим время
+        time_str = input_text.split(' ')[0]
+        hours, minutes = map(int, time_str.split(':'))
+
+        current_date = datetime.datetime.now(tz).date()
+        new_end_time = tz.localize(datetime.datetime.combine(current_date, datetime.time(hours, minutes)))
+
+        # Если время меньше текущего, добавляем день
+        if new_end_time < datetime.datetime.now(tz):
+            new_end_time += datetime.timedelta(days=1)
+
+        # Получаем данные брони
+        with data_cache.lock:
+            reservation = next((r for r in data_cache.reservations
+                                if str(r['id']) == reservation_id), None)
+
+        if not reservation:
+            safe_send_message(chat_id, "❌ Бронь не найдена")
+            del USER_STATES[chat_id]
+            return
+
+        # Проверка: новое время должно быть больше старого
+        if new_end_time <= reservation['end']:
+            safe_send_message(chat_id, "❌ Новое время должно быть позже текущего окончания брони")
+            return
+
+        # Проверка доступности тележки
+        if not is_cart_available(reservation['cart'], reservation['start'], new_end_time):
+            safe_send_message(
+                chat_id,
+                "❌ Пока вы выбирали время, этот слот успели занять. Пожалуйста, выберите другое время.",
+                reply_markup=create_main_keyboard(message.from_user.username)
+            )
+            del USER_STATES[chat_id]
+            return
+
+        # Обновляем время окончания
+        updates = {
+            reservation_id: {
+                'Конец': new_end_time.strftime('%Y-%m-%d %H:%M')
+            }
+        }
+
+        # Асинхронное обновление
+        def async_update_extension():
+            success = async_update_sheet('Бронирования', updates)
+            if success:
+                # Обновляем кэш
+                updated_res = {
+                    'id': reservation_id,
+                    'end': new_end_time
+                }
+                update_reservation_in_cache(updated_res)
+
+                # Отправляем уведомление в общий чат
+                extension_msg = (
+                    f"🔄 Бронь продлена!\n\n"
+                    f"🛒 Тележка: {reservation['cart']}\n"
+                    f"👤 Пользователь: @{reservation['username']}\n"
+                    f"🕐 Новое время окончания: {new_end_time.strftime('%H:%M')}\n"
+                    f"📅 Дата: {new_end_time.strftime('%d.%m.%Y')}"
+                )
+                send_notification(extension_msg)
+
+                safe_send_message(chat_id,
+                                  f"✅ Бронь успешно продлена до {new_end_time.strftime('%H:%M')}",
+                                  reply_markup=create_main_keyboard(message.from_user.username))
+            else:
+                safe_send_message(chat_id, "❌ Ошибка при обновлении брони")
+
+        Thread(target=async_update_extension).start()
+        del USER_STATES[chat_id]
+
+    except Exception as e:
+        error_id = str(uuid.uuid4())[:8]
+        logger.error(f"Ошибка продления брони: {error_id} - {str(e)}")
+        safe_send_message(chat_id, f"❌ Ошибка: {str(e)}")
 
 
 # Подтверждение бронирования
@@ -1540,6 +1847,57 @@ def handle_general_cancel(message):
 
     safe_send_message(chat_id, "❌ Действие отменено",
                       reply_markup=create_main_keyboard(username))
+
+
+# Обработчик кнопки "Продлить"
+@bot.callback_query_handler(func=lambda call: call.data.startswith('extend_'))
+def handle_extend_reservation(call):
+    chat_id = call.message.chat.id
+    reservation_id = call.data.split('_')[1]
+
+    try:
+        # Находим бронь
+        with data_cache.lock:
+            reservation = next((r for r in data_cache.reservations
+                                if str(r['id']) == reservation_id and r['status'] == 'Активна'), None)
+
+        if not reservation:
+            bot.answer_callback_query(call.id, "❌ Активная бронь не найдена")
+            return
+
+        # Генерируем слоты ОТ ТЕКУЩЕГО ВРЕМЕНИ ОКОНЧАНИЯ БРОНИ
+        time_slots = generate_extension_slots(reservation)
+
+        # # Генерируем слоты как при создании брони, но начиная с текущего времени
+        # time_slots = generate_time_slots(
+        #     tz.localize(datetime.datetime.combine(date, datetime.time(0, 0))),
+        #     step_minutes=15
+        # )
+
+        if not time_slots:
+            bot.answer_callback_query(
+                call.id,
+                "❌ Нет доступных слотов для продления. Тележка уже забронирована.",
+                #show_alert=True
+            )
+            return
+
+        USER_STATES[chat_id] = {
+            'step': 'select_extension_time',
+            'reservation_id': reservation_id,
+            'timestamp': time.time()
+        }
+
+        safe_send_message(
+            chat_id,
+            f"🔄 Выберите новое время окончания (текущее: {reservation['end'].strftime('%H:%M')}):",
+            reply_markup=create_time_keyboard(time_slots)
+        )
+
+    except Exception as e:
+        error_id = str(uuid.uuid4())[:8]
+        logger.error(f"Ошибка начала продления: {error_id} - {str(e)}")
+        bot.answer_callback_query(call.id, "❌ Ошибка")
 
 
 # Обработка завершения брони
@@ -2102,6 +2460,9 @@ def handle_my_reservations(message):
     username = message.from_user.username
 
     try:
+        # УМНОЕ обновление - только если данные помечены как устаревшие
+        data_cache.smart_refresh(['reservations'])
+
         # Используем блокировку для безопасного доступа к кэшу
         with data_cache.lock:
             user_reservations = [
@@ -2160,6 +2521,7 @@ def handle_reservation_action(call):
             )
         elif status == 'Активна':
             keyboard.add(
+                types.InlineKeyboardButton('🔄 Продлить', callback_data=f'extend_{reservation_id}'),
                 types.InlineKeyboardButton('✅ Завершить бронь', callback_data=f'return_{reservation_id}')
             )
 
@@ -2192,6 +2554,8 @@ def handle_cancel_reservation(call):
     reservation_id = call.data.split('_')[1]
 
     try:
+        bot.answer_callback_query(call.id, "Отменяем бронь...")
+
         # Находим бронирование
         with data_cache.lock:
             reservation = next((r for r in data_cache.reservations if str(r['id']) == reservation_id), None)
@@ -2206,16 +2570,48 @@ def handle_cancel_reservation(call):
 
         # Асинхронная отмена брони
         def async_cancel_reservation():
-            if cancel_reservation(reservation_id, "отменено пользователем"):
-                start_str = reservation['start'].strftime('%d.%m %H:%M')
-                end_str = reservation['end'].strftime('%H:%M')
-                cart_name = reservation['cart']
+            try:
+                success = cancel_reservation(reservation_id, "отменено пользователем")
 
-                success_msg = f"✅ Бронь {cart_name} на {start_str}-{end_str} отменена"
-                bot.edit_message_text(success_msg, chat_id, call.message.message_id)
+                # # Обновляем кэш
+                # data_cache.mark_dirty('reservations')
+                # data_cache.refresh(partial=['reservations'])
+                if success:
+                    start_str = reservation['start'].strftime('%d.%m %H:%M')
+                    end_str = reservation['end'].strftime('%H:%M')
+                    cart_name = reservation['cart']
+
+                    success_msg = f"✅ Бронь {cart_name} на {start_str}-{end_str} отменена"
+                    try:
+                        bot.edit_message_text(
+                            success_msg,
+                            chat_id,
+                            call.message.message_id
+                        )
+                    except:
+                        # Если сообщение уже изменено, просто логируем
+                        logger.info("Сообщение уже обновлено")
+                else:
+                    try:
+                        bot.edit_message_text(
+                            "❌ Ошибка при отмене брони",
+                            chat_id,
+                            call.message.message_id
+                        )
+                    except:
+                        pass
+            except Exception as e:
+                logger.error(f"Ошибка при отмене: {str(e)}")
+                try:
+                    bot.edit_message_text(
+                        "❌ Ошибка при отмене брони",
+                        chat_id,
+                        call.message.message_id
+                    )
+                except:
+                    pass
 
         Thread(target=async_cancel_reservation).start()
-        bot.answer_callback_query(call.id, "Отменяем бронь...")
     except requests.exceptions.ProxyError as e:
         logger.error(f"Ошибка прокси при обработке callback: {str(e)}")
         try:
@@ -2225,7 +2621,10 @@ def handle_cancel_reservation(call):
     except Exception as e:
         error_id = str(uuid.uuid4())[:8]
         logger.error(f"Ошибка отмены брони: {error_id} - {str(e)}")
-        bot.answer_callback_query(call.id, "❌ Ошибка отмены брони")
+        try:
+            bot.answer_callback_query(call.id, "❌ Ошибка отмены брони")
+        except:
+            pass
 
 
 # Все активные брони (админ)
@@ -2416,9 +2815,14 @@ def handle_admin_cancel(call):
 @private_chat_only
 def handle_refresh(message):
     try:
-        # Обновляем только бронирования (самые частые изменения)
-        data_cache.refresh(partial=['reservations'])
-        safe_send_message(message.chat.id, "✅ Данные обновлены!")
+        # Принудительно помечаем все как устаревшее и обновляем
+        data_cache.mark_dirty()  # Помечаем ВСЕ как устаревшее
+        success = data_cache.refresh(force=True)
+
+        if success:
+            safe_send_message(message.chat.id, "✅ Данные обновлены!")
+        else:
+            safe_send_message(message.chat.id, "⚠️ Данные обновлены с ограничениями")
     except Exception as e:
         error_id = str(uuid.uuid4())[:8]
         logger.error(f"Ошибка обновления: {error_id} - {str(e)}")
@@ -2430,6 +2834,9 @@ def send_reminders():
     try:
         current_time = datetime.datetime.now(tz)
         logger.info(f"Проверка напоминаний в {current_time} (UTC: {current_time.astimezone(pytz.utc)})")
+
+        # ОБНОВЛЯЕМ КЭШ ПЕРЕД ПРОВЕРКОЙ
+        data_cache.smart_refresh(['reservations'])
 
         with data_cache.lock:
             reservations_cache_copy = data_cache.reservations.copy()
@@ -2702,13 +3109,17 @@ def cleanup_old_alerts():
 
     for key in list(reminder_status.keys()):
         # Для конфликт-алертов: удаляем через 2 часа после создания
-        if key.startswith('conflict_alert_') and current_time - reminder_status[key] > 7200:  # 1 час
+        if key.startswith('conflict_alert_') and current_time - reminder_status[key] > 7200:  # 2 час
             keys_to_remove.append(key)
 
         # Для смарт-напоминаний: удаляем через 4 часа
         elif key.startswith('smart_reminder_'):
             if current_time - reminder_status[key] > 14400:  # 4 часа
                 keys_to_remove.append(key)
+
+        # Очистка старых напоминаний (старше 24 часов)
+        elif current_time - reminder_status[key] > 86400:  # 24 часа
+            keys_to_remove.append(key)
 
     for key in keys_to_remove:
         del reminder_status[key]
@@ -2719,11 +3130,11 @@ def cleanup_old_alerts():
 def start_scheduler():
     schedule.every(1).minutes.do(send_reminders) # Напоминания за 15 минут до начала и окончания
     schedule.every(2).minutes.do(check_all_pending_reservations) # Отмена неподтвержденных броней
-    schedule.every(30).minutes.do(periodic_refresh) # Регулярное обновление кэша
+    # schedule.every(30).minutes.do(periodic_refresh) # Регулярное обновление кэша
     schedule.every(30).minutes.do(cleanup_states) # Очистка устаревших состояний
 
     schedule.every(5).minutes.do(check_upcoming_reservations) # Проверка конфликтов
-    schedule.every(1).hours.do(cleanup_old_alerts) # Удаление астарых алертов из памяти
+    schedule.every(2).hours.do(cleanup_old_alerts) # Удаление старых алертов из памяти
 
     while True:
         try:
@@ -2746,15 +3157,19 @@ def keep_alive():
             # Проверяем обычное интернет-соединение (без прокси)
             session = requests.Session()
             session.trust_env = False  # Игнорируем системные прокси
-            session.get('https://google.com', timeout=10)
+            response = session.get('https://google.com', timeout=10)
 
-            logger.info("✓ Соединение с Telegram API и интернетом установлено")
-            retry_count = 0  # Сбрасываем счетчик при успехе
-            time.sleep(240 + random.randint(0, 120))
+            if response.status_code == 200:
+                logger.info("✓ Соединение с Telegram API и интернетом установлено")
+                retry_count = 0
+                time.sleep(240 + random.randint(0, 120))
+            else:
+                raise requests.exceptions.ConnectionError("Google недоступен")
 
         except (requests.exceptions.ProxyError,
                 requests.exceptions.ConnectionError,
-                RemoteDisconnected) as e:
+                RemoteDisconnected,
+                requests.exceptions.Timeout) as e:
 
             retry_count += 1
             if retry_count > max_retries:
@@ -2768,6 +3183,7 @@ def keep_alive():
 
         except Exception as e:
             logger.error(f"Ошибка поддержания активности: {str(e)}")
+            time.sleep(60)
 
 
 def main_loop():
@@ -2777,14 +3193,15 @@ def main_loop():
     while True:
         try:
             logger.info("🤖 Starting Telegram bot...")
-            bot.infinity_polling(timeout=90, long_polling_timeout=60)
+            bot.infinity_polling(timeout=90, long_polling_timeout=90)
             logger.info("Bot polling exited normally")
             break  # Выход при нормальном завершении
 
         except (requests.exceptions.ProxyError,
                 requests.exceptions.ConnectionError,
                 RemoteDisconnected,
-                requests.exceptions.SSLError) as e:
+                requests.exceptions.SSLError,
+                requests.exceptions.Timeout) as e:
             error_id = str(uuid.uuid4())[:8]
             logger.error(f"Сетевая ошибка ({error_id}): {str(e)}")
 
@@ -2792,7 +3209,7 @@ def main_loop():
             sleep_time = min(retry_delay, max_retry_delay) + random.randint(0, 10)
             logger.info(f"🔄 Перезапуск бота через {sleep_time} сек...")
             time.sleep(sleep_time)
-            retry_delay *= 2  # Увеличиваем задержку для следующей попытки
+            retry_delay = min(retry_delay * 2, max_retry_delay)  # Ограничиваем максимальную задержку
 
         except Exception as e:
             error_id = str(uuid.uuid4())[:8]
@@ -2802,7 +3219,7 @@ def main_loop():
             sleep_time = min(retry_delay, max_retry_delay)
             logger.info(f"🔄 Перезапуск бота через {sleep_time} сек...")
             time.sleep(sleep_time)
-            retry_delay *= 2
+            retry_delay = min(retry_delay * 2, max_retry_delay)
 
 
 if __name__ == '__main__':
