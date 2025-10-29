@@ -387,6 +387,7 @@ def connect_google_sheets():
     ]
     creds = ServiceAccountCredentials.from_json_keyfile_dict(GOOGLE_CREDS, scope)
     client = gspread.authorize(creds)
+    client.set_timeout(30)  # 30 секунд таймаут
     return client.open_by_key(SPREADSHEET_ID)
 
 
@@ -526,6 +527,14 @@ def update_reservation_in_cache(updated_data):
 
     try:
         with data_cache.lock:
+            # Проверяем, существует ли бронь в кэше
+            reservation_exists = any(str(res.get('id', '')) == reservation_id
+                                     for res in data_cache.reservations)
+
+            if not reservation_exists:
+                logger.warning(f"Бронь {reservation_id} не найдена в кэше для обновления")
+                return False
+
             found = False
             for i, res in enumerate(data_cache.reservations):
                 logger.debug(f"res.get('id', '') {res.get('id', '')}")
@@ -537,14 +546,11 @@ def update_reservation_in_cache(updated_data):
                     logger.debug(f"Кэш брони {updated_data['id']} обновлен")
                     found = True
                     break
-            if not found:
-                # Если бронь не найдена в кэше
-                logger.warning(f"Бронь {reservation_id} не найдена в кэше для обновления")
-                return False
 
             # Пересчитываем хеш бронирований
-            data_cache.data_hashes['reservations'] = data_cache.calculate_hash(data_cache.reservations)
-            # data_cache.mark_dirty('reservations')
+            if found:
+                data_cache.data_hashes['reservations'] = data_cache.calculate_hash(data_cache.reservations)
+                # data_cache.mark_dirty('reservations')
 
         return found
     except Exception as e:
@@ -620,6 +626,11 @@ def create_cancel_keyboard():
     return types.ReplyKeyboardMarkup(resize_keyboard=True).add(types.KeyboardButton('Отмена'))
 
 
+# Клавиатура "Назад"
+def create_back_keyboard():
+    return types.ReplyKeyboardMarkup(resize_keyboard=True).add(types.KeyboardButton('Назад'))
+
+
 # Очистка устаревших состояний с исключением для подтверждения
 def cleanup_states():
     current_time = time.time()
@@ -679,69 +690,89 @@ def cleanup_states():
 # Отмена бронирования
 def cancel_reservation(reservation_id, reason=""):
     """
-        Улучшенная функция отмены брони с гарантированной очисткой кэша
-        """
+    Улучшенная функция отмены брони с гарантированной очисткой кэша
+    """
     reservation_id = str(reservation_id)
     logger.info(f"🔍 Начинаем отмену брони {reservation_id}, причина: {reason}")
 
     try:
-        # Шаг 1: Сначала удаляем из кэша (даже если бронь не найдена в таблице)
-        logger.info(f"🔄 Шаг 1: Удаляем бронь {reservation_id} из кэша")
+        # Шаг 1: Сначала находим chat_id для очистки состояния
+        logger.info(f"🔄 Шаг 1: Сначала находим chat_id для очистки состояния")
+        chat_id_to_clean = None
+        # Кратковременная блокировка для поиска
+        with data_cache.lock:
+            for res in data_cache.reservations:
+                if str(res.get('id', '')) == reservation_id:
+                    chat_id_to_clean = res.get('chat_id')
+                    break
+
+        # Шаг 2: Очищаем состояние пользователя
+        logger.info(f"🔄 Шаг 2: Очищаем состояние пользователя")
+        if chat_id_to_clean and chat_id_to_clean in USER_STATES:
+            state = USER_STATES[chat_id_to_clean]
+            if state.get('reservation_id') == reservation_id:
+                del USER_STATES[chat_id_to_clean]
+                logger.info(f"✅ Очищено состояние пользователя {chat_id_to_clean}")
+
+        # Шаг 3: Удаляем из кэша
+        logger.info(f"🔄 Шаг 3: Удаляем бронь {reservation_id} из кэша")
         cache_success = delete_reservation_from_cache(reservation_id)
         logger.info(f"{'✅' if cache_success else '❌'} Удаление из кэша: {cache_success}")
 
-        if not worksheet_headers.get('Бронирования'):
-            init_worksheet_headers()
+        # Шаг 4: Обновляем таблицу Google Sheets
+        logger.info(f"🔄 Шаг 4: Обновляем таблицу Google Sheets")
+        def async_update_table():
+            try:
+                if not worksheet_headers.get('Бронирования'):
+                    init_worksheet_headers()
 
-        spreadsheet = connect_google_sheets()
-        sheet = spreadsheet.worksheet('Бронирования')
-        records = sheet.get_all_records()
+                spreadsheet = connect_google_sheets()
+                sheet = spreadsheet.worksheet('Бронирования')
+                records = sheet.get_all_records()
 
-        logger.info(f"🔍 Ищем бронь {reservation_id} для отмены...")
+                logger.info(f"🔍 Асинхронно ищем бронь {reservation_id} для отмены...")
 
-        found_in_table = False
-        table_updated = False
+                for i, record in enumerate(records, start=2):
+                    if str(record['ID']) == reservation_id:
+                        if record['Статус'] in ['Отменена', 'Завершена']:
+                            logger.warning(f"⚠️ Бронь {reservation_id} уже отменена")
+                            return
 
-        for i, record in enumerate(records, start=2):
-            if str(record['ID']) == reservation_id:
-                found_in_table = True
-                logger.info(f"📋 Нашли бронь {reservation_id} в таблице, строка {i}")
+                        # Быстрое обновление статуса
+                        status_col = worksheet_headers['Бронирования']['Статус']
+                        sheet.update_cell(i, status_col, 'Отменена')
+                        logger.info(f"✅ Обновили статус брони {reservation_id} в таблице")
+                        return
 
-                if record['Статус'] in ['Отменена', 'Завершена']:
-                    logger.warning(f"⚠️ Бронь {reservation_id} уже отменена")
-                    return True
+                logger.warning(f"📋 Бронь {reservation_id} не найдена в таблице")
+            except Exception as e:
+                logger.error(f"❌ Ошибка асинхронного обновления таблицы: {str(e)}")
 
-                # ОБНОВЛЯЕМ СТАТУС В ТАБЛИЦЕ
-                status_col = worksheet_headers['Бронирования']['Статус']
-                sheet.update_cell(i, status_col, 'Отменена')
-                table_updated = True
-                logger.info(f"✅ Обновили статус брони {reservation_id} в таблице на 'Отменена'")
-                break
+        # Запускаем обновление таблицы в отдельном потоке
+        table_thread = Thread(target=async_update_table, daemon=True)
+        table_thread.start()
 
-        if not found_in_table:
-            logger.warning(f"📋 Бронь {reservation_id} не найдена в таблице, но удалена из кэша")
-            return cache_success  # Возвращаем статус очистки кэша
-
-        # Шаг 3: Очищаем таймеры и напоминания
-        logger.info(f"🔄 Шаг 3: Очищаем таймеры и напоминания для {reservation_id}")
+        # Шаг 5: Очищаем таймеры и напоминания
+        logger.info(f"🔄 Шаг 5: Очищаем таймеры и напоминания для {reservation_id}")
         if reservation_id in reservation_timers:
             for timer in reservation_timers[reservation_id]:
-                timer.cancel()
+                try:
+                    timer.cancel()
+                except:
+                    pass
             del reservation_timers[reservation_id]
             logger.info(f"✅ Удалили таймеры для {reservation_id}")
 
         # Очищаем связанные напоминания
         keys_to_remove = [key for key in reminder_status if key.endswith(f"_{reservation_id}")]
         for key in keys_to_remove:
-            if key in reminder_status:
-                del reminder_status[key]
-                logger.info(f"✅ Удалили напоминание: {key}")
+            reminder_status.pop(key, None)
+            logger.info(f"✅ Удалили напоминание: {key}")
 
-        logger.info(f"🎉 Бронь {reservation_id} полностью отменена. Кэш: {cache_success}, Таблица: {table_updated}")
-        return cache_success and table_updated
+        logger.info(f"🎉 Бронь {reservation_id} полностью отменена. Кэш: {cache_success}")
+        return True
     except Exception as e:
         logger.error(f"❌ Критическая ошибка при отмене брони {reservation_id}: {str(e)}")
-        logger.error(traceback.format_exc())
         return False
 
 
@@ -1171,39 +1202,30 @@ def update_cache_after_booking(new_reservation):
 def delete_reservation_from_cache(reservation_id):
     """Полностью удаляет бронь из кэша"""
     reservation_id = str(reservation_id)
-    with data_cache.lock:
-        initial_count = len(data_cache.reservations)
 
-        # ДЕБАГ: логируем что есть в кэше перед удалением
-        found_before = [r['id'] for r in data_cache.reservations if str(r.get('id')) == reservation_id]
-        logger.debug(f"Кэш до удаления: {found_before}")
+    try:
+        with data_cache.lock:
+            initial_count = len(data_cache.reservations)
 
-        # Фильтруем список, оставляя только брони с другим ID
-        data_cache.reservations = [
-            r for r in data_cache.reservations
-            if str(r.get('id')) != reservation_id
-        ]
-        final_count = len(data_cache.reservations)
+            # Просто фильтруем список без сложной логики
+            data_cache.reservations = [
+                r for r in data_cache.reservations
+                if str(r.get('id')) != reservation_id
+            ]
+            final_count = len(data_cache.reservations)
 
-        # Если количество изменилось - бронь была удалена
-        if initial_count != final_count:
-            # Пересчитываем хеш
-            data_cache.data_hashes['reservations'] = data_cache.calculate_hash(data_cache.reservations)
-            # Помечаем как "грязные" для будущих обновлений
-            data_cache.mark_dirty('reservations')
-            logger.debug(f"Бронь {reservation_id} удалена из кэша ({initial_count} -> {final_count})")
+            if initial_count != final_count:
+                # Пересчитываем хеш
+                data_cache.data_hashes['reservations'] = data_cache.calculate_hash(data_cache.reservations)
+                logger.info(f"✅ Бронь {reservation_id} удалена из кэша ({initial_count} -> {final_count})")
+                return True
+            else:
+                logger.warning(f"⚠️ Бронь {reservation_id} не найдена в кэше")
+                return False
 
-            # ДЕБАГ: логируем что осталось в кэше после удаления
-            found_after = [r['id'] for r in data_cache.reservations if str(r.get('id')) == reservation_id]
-            logger.debug(f"Кэш после удаления: {found_after}")
-            return True
-        else:
-            logger.warning(f"⚠️ Бронь {reservation_id} не найдена в кэше. Всего броней: {final_count}")
-            # Логируем существующие ID для отладки
-            existing_ids = [r['id'] for r in data_cache.reservations]
-            logger.debug(f"📋 Существующие ID в кэше: {existing_ids}")
-            return False
-
+    except Exception as e:
+        logger.error(f"❌ Ошибка удаления брони {reservation_id} из кэша: {str(e)}")
+        return False
 
 # Обработчик команды /start
 @bot.message_handler(commands=['start'])
@@ -1673,50 +1695,38 @@ def handle_confirmation(call):
         bot.answer_callback_query(call.id, "❌ Данные устарели")
         return
 
+    state = USER_STATES[chat_id]
+
     if call.data == 'cancel_reservation':
-        # Сначала пытаемся отправить сообщение об отмене
-        if safe_send_message(chat_id, "❌ Бронирование отменено"):
-            # Только после успешной отправки отменяем бронь
-            state = USER_STATES[chat_id]
+        try:
+            bot.answer_callback_query(call.id, "Отменяем бронь...")
+
             reservation_id = state.get('reservation_id')
-
             if reservation_id:
-                # Обновляем статус в таблице
-                updates = {
-                    'Статус': 'Отменена',
-                    'ФактическоеНачало': datetime.datetime.now(tz).strftime('%Y-%m-%d %H:%M')
-                }
+                # Сразу очищаем состояние
+                del USER_STATES[chat_id]
 
-                # Создаем функцию для асинхронного обновления
-                def async_cancel_operation():
-                    success = async_update_sheet('Бронирования', {reservation_id: updates})
+                # Асинхронная отмена
+                def async_cancel():
+                    success = cancel_reservation(reservation_id, "отменено пользователем")
                     if success:
-                        logger.info(f"Бронь {reservation_id} отменена пользователем")
-                        # После успешного обновления таблицы отправляем окончательное сообщение
-                        safe_send_message(chat_id, "Выберите действие:", reply_markup=create_main_keyboard(username))
-
-                        # Принудительное обновление кэша после critical действий
-                        data_cache.refresh(partial=['reservations'])
+                        safe_send_message(chat_id, "✅ Бронь отменена",
+                                          reply_markup=create_main_keyboard(username))
                     else:
-                        logger.error(f"Ошибка отмены брони {reservation_id}")
-                        safe_send_message(chat_id, "❌ Ошибка при отмене брони. Попробуйте еще раз.")
+                        safe_send_message(chat_id, "❌ Ошибка при отмене брони")
 
-                # Запускаем в отдельном потоке
-                Thread(target=async_cancel_operation).start()
+                Thread(target=async_cancel).start()
             else:
-                logger.error("Не найден reservation_id при отмене брони")
-                safe_send_message(chat_id, "❌ Ошибка при отмене брони")
-        else:
-            logger.error(f"Не удалось отправить сообщение об отмене для chat_id {chat_id}")
-            bot.answer_callback_query(call.id, "❌ Ошибка при отправке сообщения")
+                safe_send_message(chat_id, "❌ Ошибка: ID брони не найден")
 
-        # Очищаем состояние независимо от результата
-        if chat_id in USER_STATES:
-            del USER_STATES[chat_id]
+        except Exception as e:
+            logger.error(f"Ошибка при отмене брони: {str(e)}")
+            safe_send_message(chat_id, "❌ Ошибка при отмене")
+
         return
 
     # Обработка подтверждения брони
-    state = USER_STATES[chat_id]
+    # state = USER_STATES[chat_id]
     if state['step'] != 'confirm_reservation':
         bot.answer_callback_query(call.id, "❌ Неверный шаг")
         return
@@ -1724,7 +1734,8 @@ def handle_confirmation(call):
     try:
         # Сначала отправляем сообщение с просьбой отправить фото
         if safe_send_message(chat_id, "📸 Пожалуйста, отправьте фотографию тележки перед взятием:",
-                             reply_markup=create_cancel_keyboard()):
+                             # reply_markup=create_cancel_keyboard()):
+                             reply_markup=create_back_keyboard()):
             # Только после успешной отправки обновляем состояние для ожидания фото
             USER_STATES[chat_id] = {
                 'step': 'take_photo',
@@ -1833,17 +1844,64 @@ def handle_general_cancel(message):
     username = message.from_user.username
 
     if chat_id in USER_STATES:
-        state = USER_STATES[chat_id]
+        # state = USER_STATES[chat_id]
 
-        # Отмена при ожидании фото
-        if state.get('step') == 'take_photo':
-            reservation_id = state.get('reservation_id')
-            if reservation_id:
-                if cancel_reservation(reservation_id, "команда Отмена"):
-                    safe_send_message(chat_id, "❌ Бронь отменена.")
+        # # Особый случай: отмена при ожидании фото - НЕ отменяем бронь, просто выходим из состояния
+        # if state.get('step') == 'take_photo':
+        #     reservation_id = state.get('reservation_id')
+        #
+        #     if reservation_id:
+        #         # Восстанавливаем предыдущее состояние подтверждения
+        #         USER_STATES[chat_id] = {
+        #             'step': 'confirm_reservation',
+        #             'reservation_id': reservation_id,
+        #             'cart': state.get('cart'),
+        #             'start_time': state.get('start_time'),
+        #             'end_time': state.get('end_time'),
+        #             'timestamp': time.time()
+        #         }
+        #
+        #         # Показываем клавиатуру подтверждения снова
+        #         lock_code = get_cart_codes()
+        #         confirm_text = (
+        #             f"📋 Подтвердите бронирование:\n\n"
+        #             f"📅 Дата: {state['start_time'].strftime('%d.%m.%Y')}\n"
+        #             f"⏰ Время: {state['start_time'].strftime('%H:%M')} - {state['end_time'].strftime('%H:%M')}\n"
+        #             f"🛒 Тележка: {state['cart']}\n"
+        #             f"🔒 Код замка: {lock_code}\n"
+        #             f"🕑 В заявленное время Вы отвечаете за тележку. Вернуть тележку 🧹 чистой и без мусора."
+        #         )
+        #
+        #         keyboard = types.InlineKeyboardMarkup()
+        #         keyboard.add(
+        #             types.InlineKeyboardButton('❌ Отменить', callback_data='cancel_reservation'),
+        #             types.InlineKeyboardButton('✅ Подтвердить', callback_data='confirm_reservation')
+        #         )
+        #
+        #         safe_send_message(chat_id, "❌ Отправка фото отменена. Вы можете подтвердить бронь позже:")
+        #         safe_send_message(chat_id, confirm_text, reply_markup=keyboard)
+        #         logger.info(f"🔙 Возврат к подтверждению брони {reservation_id}")
+        #
+        #         return
+        #         # logger.info(f"🔴 Отмена брони {reservation_id} из состояния take_photo")
+        #         # if cancel_reservation(reservation_id, "команда Отмена"):
+        #         #     safe_send_message(chat_id, "❌ Бронь отменена.")
+        #         # else:
+        #         #     safe_send_message(chat_id, "⚠️ Не удалось отменить бронь. Попробуйте еще раз.")
+        #     # Для других состояний - обычная отмена
+        #     else:
+        #         reservation_id = state.get('reservation_id')
+        #         if reservation_id:
+        #             logger.info(f"🔴 Отмена брони {reservation_id}")
+        #             if cancel_reservation(reservation_id, "команда Отмена"):
+        #                 # safe_send_message(chat_id, "❌ Бронь отменена.")
+        #                 pass
+        #             else:
+        #                 safe_send_message(chat_id, "⚠️ Не удалось отменить бронь. Попробуйте еще раз.")
 
-        # Удаление состояния
+        # Удаление состояния ВНЕ зависимости от результата отмены
         del USER_STATES[chat_id]
+        logger.info(f"🧹 Очищено состояние пользователя {chat_id}")
 
     safe_send_message(chat_id, "❌ Действие отменено",
                       reply_markup=create_main_keyboard(username))
@@ -2024,8 +2082,55 @@ def manage_carts(message):
 def back_to_main(message):
     chat_id = message.chat.id
     username = message.from_user.username
-    safe_send_message(chat_id, "Главное меню:",
-                      reply_markup=create_main_keyboard(username))
+
+    show_main_menu = True  # Флаг, показывать ли главное меню
+
+    if chat_id in USER_STATES:
+        state = USER_STATES[chat_id]
+
+        # Особый случай: возврат из состояния ожидания фото
+        if state.get('step') == 'take_photo':
+            reservation_id = state.get('reservation_id')
+
+            if reservation_id:
+                # Очищаем состояние
+                del USER_STATES[chat_id]
+                show_main_menu = False  # Не показываем главное меню здесь
+
+                # Отменяем подтверждение
+                updates = {
+                    'Статус': 'Ожидает подтверждения',
+                    'ФактическоеНачало': ''
+                }
+
+                def async_revert_confirmation():
+                    success = async_update_sheet('Бронирования', {reservation_id: updates})
+                    if success:
+                        updated_res = {
+                            'id': reservation_id,
+                            'status': 'Ожидает подтверждения',
+                            'actual_start': None
+                        }
+                        update_reservation_in_cache(updated_res)
+
+                        safe_send_message(chat_id,
+                                          "🔙 Возврат к подтверждению брони. Вы можете подтвердить бронь позже, зайдя в 'Мои брони'",
+                                          reply_markup=create_main_keyboard(username))
+                    else:
+                        safe_send_message(chat_id,
+                                          "⚠️ Не удалось отменить подтверждение. Бронь остается активной.",
+                                          reply_markup=create_main_keyboard(username))
+
+                Thread(target=async_revert_confirmation).start()
+                return  # Выходим
+
+        # Для других состояний - очищаем состояние, но показываем главное меню
+        del USER_STATES[chat_id]
+
+    # Показываем главное меню только если нужно
+    if show_main_menu:
+        safe_send_message(chat_id, "Главное меню:",
+                          reply_markup=create_main_keyboard(username))
 
 
 # Обработчик callback "Назад"
@@ -2557,49 +2662,39 @@ def handle_cancel_reservation(call):
         bot.answer_callback_query(call.id, "Отменяем бронь...")
 
         # Находим бронирование
+        reservation_exists = False
         with data_cache.lock:
-            reservation = next((r for r in data_cache.reservations if str(r['id']) == reservation_id), None)
+            reservation_exists = any(str(r['id']) == reservation_id for r in data_cache.reservations)
 
-        if not reservation:
+        if not reservation_exists:
             bot.answer_callback_query(call.id, "❌ Бронь не найдена")
             return
 
-        if reservation['status'] != 'Ожидает подтверждения':
-            bot.answer_callback_query(call.id, "❌ Бронь не находится в статусе 'Ожидает подтверждения'")
-            return
-
-        # Асинхронная отмена брони
-        def async_cancel_reservation():
+        # Асинхронная отмена без блокировки интерфейса
+        def async_cancel():
             try:
                 success = cancel_reservation(reservation_id, "отменено пользователем")
 
-                # # Обновляем кэш
-                # data_cache.mark_dirty('reservations')
-                # data_cache.refresh(partial=['reservations'])
                 if success:
-                    start_str = reservation['start'].strftime('%d.%m %H:%M')
-                    end_str = reservation['end'].strftime('%H:%M')
-                    cart_name = reservation['cart']
-
-                    success_msg = f"✅ Бронь {cart_name} на {start_str}-{end_str} отменена"
+                    # Быстрое обновление интерфейса
                     try:
                         bot.edit_message_text(
-                            success_msg,
+                            "✅ Бронь отменена",
                             chat_id,
                             call.message.message_id
                         )
-                    except:
-                        # Если сообщение уже изменено, просто логируем
-                        logger.info("Сообщение уже обновлено")
+                    except Exception as e:
+                        logger.debug(f"Сообщение уже обновлено: {str(e)}")
                 else:
                     try:
                         bot.edit_message_text(
-                            "❌ Ошибка при отмене брони",
+                            "⚠️ Бронь отменена (возможны задержки в обновлении)",
                             chat_id,
                             call.message.message_id
                         )
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Сообщение уже обновлено: {str(e)}")
+
             except Exception as e:
                 logger.error(f"Ошибка при отмене: {str(e)}")
                 try:
@@ -2608,21 +2703,17 @@ def handle_cancel_reservation(call):
                         chat_id,
                         call.message.message_id
                     )
-                except:
+                except Exception as e2:
                     pass
 
-        Thread(target=async_cancel_reservation).start()
-    except requests.exceptions.ProxyError as e:
-        logger.error(f"Ошибка прокси при обработке callback: {str(e)}")
-        try:
-            bot.answer_callback_query(call.id, "⚠️ Временная ошибка сети")
-        except:
-            pass
+        # Запускаем в отдельном потоке с таймаутом
+        thread = Thread(target=async_cancel, daemon=True)
+        thread.start()
+
     except Exception as e:
-        error_id = str(uuid.uuid4())[:8]
-        logger.error(f"Ошибка отмены брони: {error_id} - {str(e)}")
+        logger.error(f"Ошибка обработки отмены: {str(e)}")
         try:
-            bot.answer_callback_query(call.id, "❌ Ошибка отмены брони")
+            bot.answer_callback_query(call.id, "❌ Ошибка отмены")
         except:
             pass
 
